@@ -1,0 +1,261 @@
+c---------------------- MODULE ApalacheHotStuffCutted ----------------------
+(*
+Here we omit type part in QC
+*)
+
+
+EXTENDS Integers, FiniteSets
+
+(********************* PROTOCOL PARAMETERS **********************************)
+Corr == {0, 2, 3}          \* the set of correct processes
+Byzantine == {1}     \* the set of byzantine processes, may be empty
+N == 4             \* the total number of processes: correct, defective, and Byzantine
+T == 1             \* an upper bound on the number of Byzantine processes
+ValidNodes == {"n1", "n2"}    \* the set of valid nodes, proposed both by correct and faulty
+InvalidNodes == {"n0"}  \* the set of invalid nodes, never proposed by the correct ones
+MaxView == 3       \* the maximal view number
+Leader == [v \in 0..MaxView |-> v % N]        \* the leader function from 0..NViews to 1..N
+
+
+ASSUME(N = Cardinality(Corr \union Byzantine))
+
+(********************* TYPE ANNOTATIONS FOR APALACHE *************************)
+\* the operator for type annotations
+a <: b == a
+
+\* the type of quorum sertificate
+QCT == [viewNumber |-> Int, node |-> STRING] \* qc.sig - ommited
+
+\* type annotations
+
+SetOfQCs(S) == S <: {QCT}
+
+EmptyQCsSet == {} <: {QCT}
+
+(*************************** DEFINITIONS ************************************)
+AllProcs == Corr \union Byzantine      \* the set of all processes
+
+Views == 0..MaxView                 \* the set of potential rounds
+NilView == 0   \* a special value to denote a nil round, outside of Views
+ViewsOrNil == Views \union {NilView} \* this is dumb
+
+Nodes == ValidNodes \union InvalidNodes \* the set of all nodes
+NilNode == "None"  \* a special value (_|_ in paper)
+NodesOrNil == Nodes \union {NilNode}
+
+Phases == {"PREPARE", "PRECOMMIT", "COMMIT", "DECIDE", "NEW-VIEW"}
+PhasesExtended == Phases \union {"PREPARE'"}
+
+QCs == [viewNumber : ViewsOrNil, node : NodesOrNil] <: {QCT} \* why I had to change it?
+NilQC == [viewNumber |-> NilView, node |-> NilNode] <: QCT \* _|_
+QCsOrNil == QCs \union SetOfQCs({NilQC})
+
+\* The validity predicate
+ExtendsFrom == [n \in NodesOrNil |-> [pn \in NodesOrNil |-> (n \in ValidNodes)]] \* probably we should specialize it by hands?
+
+\* the two thresholds that are used in the algorithm
+WEAK_THRESHOLD == T + 1     \* at least one process is not faulty
+STRONG_THRESHOLD == N - T \* a quorum when having N > 3 * T
+
+(********************* PROTOCOL STATE VARIABLES ******************************)
+VARIABLES
+  curView,    \* a process round number: Corr -> Views
+  phase,     \* a process phase: Corr -> { "PREPARE", "PRECOMMIT", "COMMIT", "DECIDE" }
+  decision, \* process decision: Corr -> QCsOrNilQC
+  lockedQC,  \* a locked value: Corr -> QCsOrNil
+  prepareQC   \* a valid value: Corr -> QCsOrNil
+
+\* book-keeping variables
+VARIABLES
+  msgsNewViewJustify,      \* msgs : src -> view -> node -> set_of_QCs
+  msgsPrepareJustify,      \* msgs : src -> view -> node -> set_of_QCs
+  \* because we really need only them as msgs + QCs
+  QCsMsgsCount,            \* Count : view -> node -> Int how many msgs were sent that can form that QC
+  QCsFormed                \* for byzantine
+ 
+\* a handy definition used in UNCHANGED
+vars == <<curView, phase, decision, lockedQC, QCsFormed,
+          prepareQC, msgsNewViewJustify, msgsPrepareJustify, QCsMsgsCount>>
+                                         
+(************************ TYPE INVARIANT ************************************)
+
+(* the standard type invariant *)
+TypeOK ==
+    /\ curView \in [Corr -> Views]
+    /\ phase \in [Corr -> PhasesExtended]
+    /\ decision \in [Views -> [Corr -> ValidNodes \union {NilNode}]]
+    /\ lockedQC \in [Corr -> QCsOrNil]
+    /\ prepareQC \in [Corr -> QCsOrNil]
+    /\ msgsNewViewJustify \in [AllProcs -> [Views -> [NodesOrNil -> SUBSET QCsOrNil]]]
+    /\ msgsPrepareJustify \in [AllProcs -> [Views -> [NodesOrNil -> SUBSET QCsOrNil]]]
+    /\ QCsMsgsCount \in [Phases -> [Views -> [NodesOrNil -> Int]]]
+    /\ QCsFormed \in [Views -> [NodesOrNil -> BOOLEAN]]
+
+(************************ PROTOCOL INITIALIZATION ******************************)
+
+InitFuncForNewViewJustify(s, v, n) ==
+   IF s \in Corr
+   THEN IF n = NilNode /\ v = 0
+        THEN SetOfQCs({NilQC})
+        ELSE EmptyQCsSet
+   ELSE SetOfQCs({NilQC})
+
+InitFuncForPrepareJustify(s, v, n) ==
+   IF s \in Byzantine
+   THEN SetOfQCs({NilQC})
+   ELSE EmptyQCsSet
+
+Init ==
+    /\ curView = [p \in Corr |-> 1]
+    /\ phase = [p \in Corr |-> "PREPARE"]
+    /\ decision = [v \in Views |-> [p \in Corr |-> NilNode]]
+    /\ lockedQC = [p \in Corr |-> NilQC]
+    /\ prepareQC = [p \in Corr |-> NilQC]
+    /\ msgsNewViewJustify = [s \in AllProcs |-> [v \in Views |-> [n \in NodesOrNil |-> 
+                                                       InitFuncForNewViewJustify(s, v, n)]]]
+    /\ msgsPrepareJustify = [s \in AllProcs |-> [v \in Views |-> [n \in NodesOrNil |-> 
+                                                       InitFuncForPrepareJustify(s, v, n)]]]
+    /\ QCsMsgsCount = [t \in Phases |-> [v \in ViewsOrNil |-> [n \in NodesOrNil |-> T]]]
+    /\ QCsFormed = [[v \in Views |-> [n \in NodesOrNil |-> FALSE]] EXCEPT ![NilView][NilNode] = TRUE]
+        
+(************************ PROTOCOL TRANSLATION ******************************)
+
+\* PREPARE phase
+
+\* line 2 - 6
+PreparePhaseAsLeader(p) ==
+   /\ phase[p] = "PREPARE"
+   /\ p = Leader[curView[p]] \* line 2 
+   /\ \E Msrc \in SUBSET AllProcs : \E n \in NodesOrNil:
+      /\ Cardinality(Msrc) >= STRONG_THRESHOLD
+      /\ \A s \in Msrc : msgsNewViewJustify[s][curView[p] - 1][n] /= EmptyQCsSet
+      /\ \E s \in Msrc : \E highQC \in msgsNewViewJustify[s][curView[p] - 1][n]  :
+         /\ \A otherSrc \in Msrc : \E qc \in msgsNewViewJustify[otherSrc][curView[p] - 1][n] :
+            \/ otherSrc = s \* because we picked all QCs of all buckets
+            \/ highQC.viewNumber \geq qc.viewNumber
+         /\ \E newNode \in ValidNodes : 
+            msgsPrepareJustify' = [msgsPrepareJustify EXCEPT ![p][curView[p]][newNode] = msgsPrepareJustify[p][curView[p]][newNode] \union {highQC}]
+   /\ phase' = [phase EXCEPT ![p] = "PREPARE'"]
+   /\ UNCHANGED <<curView, decision, lockedQC, QCsFormed,
+          prepareQC, msgsNewViewJustify, QCsMsgsCount>>
+          
+\* line 7 - 10
+PreparePhaseAsReplica(p) ==
+   /\ (phase[p] = "PREPARE" /\ p /= Leader[curView[p]]) \/ phase[p] = "PREPARE'"
+   /\ \E n \in NodesOrNil :  \E qc \in msgsPrepareJustify[Leader[curView[p]]][curView[p]][n] :
+      /\ IF ExtendsFrom[n][qc.node] /\ (ExtendsFrom[n][lockedQC[p].node] \/ qc.viewNumber > lockedQC[p].viewNumber)
+         THEN QCsMsgsCount' = [QCsMsgsCount EXCEPT !["PREPARE"][curView[p]][n] = QCsMsgsCount["PREPARE"][curView[p]][n] + 1]
+         ELSE QCsMsgsCount' = QCsMsgsCount
+      /\ phase' = [phase EXCEPT ![p] = "PRECOMMIT"]
+      /\ UNCHANGED <<curView, decision, lockedQC, QCsFormed,
+          prepareQC, msgsNewViewJustify, msgsPrepareJustify>>
+
+\* PRECOMMIT phase
+          
+\* line 15 - 18
+PrecommitPhaseAsReplica(p) ==
+   /\ phase[p] = "PRECOMMIT"
+   /\ \E n \in NodesOrNil : LET qc == [viewNumber |-> curView[p], node |-> n] IN
+      /\ QCsMsgsCount["PREPARE"][curView[p]][n] >= STRONG_THRESHOLD
+      /\ prepareQC' = [prepareQC EXCEPT ![p] = qc] \* line 17
+      /\ phase' = [phase EXCEPT ![p] = "COMMIT"]
+      /\ QCsMsgsCount' = [QCsMsgsCount EXCEPT !["PRECOMMIT"][curView[p]][qc.node] = QCsMsgsCount["PRECOMMIT"][curView[p]][qc.node] + 1]
+      /\ UNCHANGED <<curView, decision, lockedQC, QCsFormed,
+          msgsNewViewJustify, msgsPrepareJustify>>
+
+
+\* COMMIT phase
+
+\* line 23 - 26 
+CommitPhaseAsReplica(p) ==
+   /\ phase[p] = "COMMIT"
+   /\ \E n \in NodesOrNil : LET qc == [viewNumber |-> curView[p], node |-> n] IN
+      /\ QCsMsgsCount["PRECOMMIT"][curView[p]][n] >= STRONG_THRESHOLD
+      /\ lockedQC' = [lockedQC EXCEPT ![p] = qc] \* line 25
+      /\ phase' = [phase EXCEPT ![p] = "DECIDE"]
+      /\ QCsMsgsCount' = [QCsMsgsCount EXCEPT !["COMMIT"][curView[p]][qc.node] = QCsMsgsCount["COMMIT"][curView[p]][qc.node] + 1]
+      /\ UNCHANGED <<curView, decision, QCsFormed,
+          prepareQC, msgsNewViewJustify, msgsPrepareJustify>>
+
+\* DECIDE phase
+
+\* line 31- 34
+DecidePhaseAsReplica(p) ==
+   /\ phase[p] = "DECIDE" \* There is a very strange line here - wait for message m from leader(curView)
+   /\ \E n \in NodesOrNil : LET qc == [viewNumber |-> curView[p], node |-> n] IN
+      /\ QCsMsgsCount["COMMIT"][curView[p]][n] >= STRONG_THRESHOLD
+      /\ phase' = [phase EXCEPT ![p] = "NEW-VIEW"]
+      /\ decision' = [decision EXCEPT ![curView[p]][p] = lockedQC[p].node]
+      /\ QCsMsgsCount' = [QCsMsgsCount EXCEPT !["DECIDE"][curView[p]][qc.node] = QCsMsgsCount["DECIDE"][curView[p]][qc.node] + 1]
+   /\ UNCHANGED <<curView, lockedQC, QCsFormed,
+          prepareQC, msgsNewViewJustify, msgsPrepareJustify>>
+
+\* line 35 - 36
+NextViewInterrupt(p) ==
+   /\ msgsNewViewJustify' = [msgsNewViewJustify EXCEPT ![p][curView[p]][NilNode] = 
+                                      msgsNewViewJustify[p][curView[p]][NilNode] \union {prepareQC[p]}]
+   /\ phase' = [phase EXCEPT ![p] = "PREPARE"]
+   /\ curView[p] < MaxView
+   /\ curView' = [curView EXCEPT ![p] = curView[p] + 1]
+   /\ UNCHANGED <<decision, lockedQC, QCsFormed,
+          prepareQC, msgsPrepareJustify, QCsMsgsCount>>
+
+EnableOnByzantine(p, s1, s2) ==
+   IF p \in Byzantine
+   THEN s1
+   ELSE s2
+   
+\* here we don't change QCsMsgsCount - is this a problem?
+AddQCAndFakeMsgs == 
+   /\ \E t \in Phases : \E v \in ViewsOrNil : \E n \in NodesOrNil :
+      /\ QCsMsgsCount[t][v][n] >= STRONG_THRESHOLD
+      /\ QCsFormed[v][n] = FALSE
+      /\ LET newQC == [viewNumber |-> v, node |-> n] IN
+         /\ msgsNewViewJustify' = [p \in AllProcs |-> 
+                                                     EnableOnByzantine(p,
+                                                        [byzView \in Views |-> [byzNode \in NodesOrNil |-> msgsNewViewJustify[p][byzView][byzNode] \union SetOfQCs({newQC})]],
+                                                        msgsNewViewJustify[p])]
+         /\ msgsPrepareJustify' = [p \in AllProcs |-> 
+                                                     EnableOnByzantine(p,
+                                                        [byzView \in Views |-> [byzNode \in NodesOrNil |-> msgsPrepareJustify[p][byzView][byzNode] \union SetOfQCs({newQC})]],
+                                                        msgsPrepareJustify[p])]
+      /\ QCsFormed' = [QCsFormed EXCEPT ![v][n] = TRUE]
+   /\ UNCHANGED <<curView, phase, decision, lockedQC, prepareQC, QCsMsgsCount>>
+   
+   
+Next ==
+   \/ \E p \in Corr :
+      \/ PreparePhaseAsLeader(p)
+      \/ PreparePhaseAsReplica(p)
+      \/ PrecommitPhaseAsReplica(p)
+      \/ CommitPhaseAsReplica(p)
+      \/ DecidePhaseAsReplica(p)
+      \/ NextViewInterrupt(p) 
+   \/ AddQCAndFakeMsgs
+   \/ UNCHANGED vars
+
+(******************************** PROPERTIES  ***************************************)
+
+\* the safety property -- agreement
+Agreement == 
+   \A v \in Views:
+      \A p, q \in Corr:
+         \/ decision[v][p] = NilNode
+         \/ decision[v][q] = NilNode
+         \/ decision[v][p] = decision[v][q]
+
+\* the protocol validity
+Validity ==
+   \A v \in Views: \A p \in Corr: decision[v][p] \in ValidNodes \union {NilNode}
+    
+Inv == Agreement /\ Validity /\ TypeOK
+                     
+(******************************** DEBUG  ***************************************)
+
+NoDecision == \A v \in Views: \A p \in Corr: decision[v][p] = NilNode 
+
+NoMovement == 
+   /\ curView = [p \in Corr |-> 1]
+   /\ phase = [p \in Corr |-> "PREPARE"]
+
+=============================================================================
