@@ -11,8 +11,8 @@ CONSTANT
    Byzantine,     \* the set of byzantine processes, may be empty
    N,             \* the total number of processes: correct, defective, and Byzantine
    T,             \* an upper bound on the number of Byzantine processes
-   MaxView,       \* the maximal view number
-   Leader         \* the leader function from 0..NViews to 1..N
+   MaxView       \* the maximal view number
+Leader == [v \in 0..MaxView |-> v % N]         \* the leader function from 0..NViews to 1..N
 
 F == Cardinality(Byzantine)
 
@@ -268,7 +268,7 @@ DecisionsValidity(proc, view, node) ==
    ELSE /\ (IF node = NilNode
             THEN TRUE
             ELSE ExtendsFrom[node][decision[view][proc]])
-        /\ DecisionsValidity(proc, view - 1, decision[view][proc])
+        /\ DecisionsValidity(proc, view - 1, IF decision[view][proc] = NilNode THEN node ELSE decision[view][proc])
 
 Validity ==
    \A p \in Corr : DecisionsValidity(p, MaxView - 1, NilNode)
